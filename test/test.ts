@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -1209,7 +1209,7 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("pi-web-access/index.ts"));
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
@@ -1279,9 +1279,9 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-    assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-    assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  it("adds the child question tool without an explicit tool restriction", () => {
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined), "ask_question");
+    assert.equal(testApi.buildSubagentToolAllowlist(""), "ask_question");
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1321,11 +1321,10 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {
+  it("rejects a loadout without a tool allowlist", () => {
     withTempDir((d) => {
-      const parts: string[] = [];
-      testApi.applySandboxToParts(
-        parts,
+      assert.throws(() => testApi.applySandboxToParts(
+        [],
         {
           agent: null,
           toolAllowlist: null,
@@ -1339,8 +1338,7 @@ describe("subagent discovery", () => {
           agentDir: null,
         },
         { artifactDir: d, name: "fork" },
-      );
-      assert.deepEqual(parts, []);
+      ), /no tool allowlist/);
     });
   });
 
@@ -1921,11 +1919,11 @@ describe("tool registration", () => {
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
-  it("no longer registers subagent_interrupt or subagent_resume", () => {
+  it("registers subagent_interrupt but not the removed resume tool", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
-    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_interrupt"), true);
     assert.equal(names.includes("subagent_resume"), false);
   });
 });
@@ -2117,12 +2115,12 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_message and not the old interrupt/resume tools", () => {
+  it("registers subagent_message and subagent_interrupt, but not resume", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_message"), true);
-    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_interrupt"), true);
     assert.equal(names.includes("subagent_resume"), false);
   });
 

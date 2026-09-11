@@ -1,50 +1,37 @@
-/**
- * tmux surface layer — the only terminal multiplexer this extension supports.
- *
- * Everything the extension does to a pane goes through the small API in this
- * file: create/split a pane, type a command into it, read its screen, close
- * it, and poll for exit. Keeping the tmux calls isolated here means index.ts
- * stays testable without a multiplexer running.
- *
- * Panes are identified by tmux pane ids (e.g. `%12`). Splits always target
- * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
- * the user's focus.
- */
 import { execFile, execFileSync } from "node:child_process";
-import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-
-// ── Availability ──
-
+const SUBAGENT_TMUX_LAYOUT = "tiled";
+const WINDOW_NAME = "pi-agents";
+const WINDOW_OWNER_OPTION = "@pi_subagents_owner";
+const PANE_OWNER_OPTION = "@pi_subagent_owned";
 const commandAvailability = new Map<string, boolean>();
+let cachedWindowId: string | null = null;
+let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
 
 function hasCommand(command: string): boolean {
-  if (commandAvailability.has(command)) {
-    return commandAvailability.get(command)!;
-  }
-
+  const cached = commandAvailability.get(command);
+  if (cached !== undefined) return cached;
   let available = false;
   try {
     execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
     available = true;
-  } catch {
-    available = false;
-  }
-
+  } catch {}
   commandAvailability.set(command, available);
   return available;
 }
 
-/**
- * True when running inside tmux with the tmux binary on PATH.
- * `TMUX` is set by tmux in every process it spawns (shell or pane).
- */
+export function muxSocketPath(): string | null {
+  const raw = process.env.TMUX?.split(",", 1)[0]?.trim();
+  return raw && raw.startsWith("/") ? raw : null;
+}
+
 export function isTmuxAvailable(): boolean {
-  return !!process.env.TMUX && hasCommand("tmux");
+  return !!muxSocketPath() && !!process.env.TMUX_PANE && hasCommand("tmux");
 }
 
 export function isMuxAvailable(): boolean {
@@ -56,214 +43,232 @@ export function muxSetupHint(): string {
 }
 
 function requireTmux(): void {
-  if (!isTmuxAvailable()) {
-    throw new Error(`tmux is required for subagents. ${muxSetupHint()}`);
+  if (!isTmuxAvailable()) throw new Error(`tmux is required for subagents. ${muxSetupHint()}`);
+}
+
+export function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function tmux(args: string[]): string {
+  return execFileSync("tmux", args, { encoding: "utf8" }).trim();
+}
+
+function parentPane(): string {
+  requireTmux();
+  return process.env.TMUX_PANE!;
+}
+
+function ownerToken(): string {
+  return parentPane();
+}
+
+export function surfaceExists(pane: string): boolean {
+  try {
+    return tmux(["display-message", "-p", "-t", pane, "#{pane_id}"]) === pane;
+  } catch {
+    return false;
   }
 }
 
-// ── Shell helpers ──
-
-export function shellEscape(s: string): string {
-  return "'" + s.replace(/'/g, "'\\''") + "'";
+function windowExists(window: string): boolean {
+  try {
+    return tmux(["display-message", "-p", "-t", window, "#{window_id}"]) === window;
+  } catch {
+    return false;
+  }
 }
 
-// ── Pane layout ──
+function findOwnedWindow(): string | null {
+  requireTmux();
+  const sessionId = tmux(["display-message", "-p", "-t", parentPane(), "#{session_id}"]);
+  const rows = tmux([
+    "list-windows",
+    "-t",
+    sessionId,
+    "-F",
+    `#{window_id}\t#{${WINDOW_OWNER_OPTION}}`,
+  ]);
+  for (const row of rows.split("\n")) {
+    const [windowId, owner] = row.split("\t");
+    if (windowId?.startsWith("@") && owner === ownerToken()) return windowId;
+  }
+  return null;
+}
 
-/**
- * tmux layout applied to the subagent window to keep panes evenly sized.
- * Switchable: "even-horizontal" (equal columns, matches Ctrl+b Alt+1),
- * "main-vertical" (big main pane + tiled column), "tiled" (grid).
- */
-const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
+function resolveOwnedWindow(): string | null {
+  if (cachedWindowId && windowExists(cachedWindowId)) {
+    const owner = tmux(["show-options", "-wqv", "-t", cachedWindowId, WINDOW_OWNER_OPTION]);
+    if (owner === ownerToken()) return cachedWindowId;
+  }
+  cachedWindowId = findOwnedWindow();
+  return cachedWindowId;
+}
 
-let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
+function markPane(pane: string): void {
+  tmux(["set-option", "-pq", "-t", pane, PANE_OWNER_OPTION, ownerToken()]);
+}
 
-/**
- * Re-balance subagent panes so repeated splits don't leave them lopsided.
- * tmux halves the target pane on every split and dumps freed space onto a
- * neighbor on close, so without this panes drift to wildly uneven widths.
- * Applies SUBAGENT_TMUX_LAYOUT to the parent pi window. Debounced so a burst
- * of parallel spawns or staggered exits collapses into a single layout call,
- * and non-fatal: a cosmetic resize must never break spawning or watching.
- */
-function rebalanceSurfaces(hintPane?: string): void {
-  // Prefer the parent pi pane (stable; survives a closing subagent pane).
-  const target = process.env.TMUX_PANE ?? hintPane;
-  if (!target) return;
+function createAgentWindow(cwd: string): { window: string; pane: string } {
+  const parentWindow = tmux(["display-message", "-p", "-t", parentPane(), "#{window_id}"]);
+  const output = tmux([
+    "new-window", "-d", "-a", "-t", parentWindow, "-n", WINDOW_NAME, "-c", cwd,
+    "-P", "-F", "#{window_id}\t#{pane_id}",
+  ]);
+  const [window, pane] = output.split("\t");
+  if (!window?.startsWith("@") || !pane?.startsWith("%")) {
+    throw new Error(`Unexpected tmux new-window output: ${output}`);
+  }
+  tmux(["set-option", "-wq", "-t", window, WINDOW_OWNER_OPTION, ownerToken()]);
+  // Keep a stable title for this owned window only. The user's global tmux
+  // automatic-rename and allow-rename settings remain unchanged.
+  tmux(["set-option", "-wq", "-t", window, "automatic-rename", "off"]);
+  tmux(["set-option", "-wq", "-t", window, "allow-rename", "off"]);
+  tmux(["rename-window", "-t", window, WINDOW_NAME]);
+  markPane(pane);
+  cachedWindowId = window;
+  return { window, pane };
+}
+
+function rebalanceSurfaces(windowHint?: string): void {
+  const window = windowHint ?? resolveOwnedWindow();
+  if (!window) return;
   if (rebalanceTimer) clearTimeout(rebalanceTimer);
   rebalanceTimer = setTimeout(() => {
     rebalanceTimer = null;
     try {
-      // -t <pane> resolves to that pane's window; does not change focus.
-      execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
-        encoding: "utf8",
-      });
-    } catch {
-      // Pane/window may be gone; balancing is best-effort.
-    }
+      tmux(["select-layout", "-t", window, SUBAGENT_TMUX_LAYOUT]);
+    } catch {}
   }, 120);
 }
 
-// ── Surface primitives ──
+export function createSurface(name: string, cwd = process.cwd()): string {
+  void name;
+  requireTmux();
+  const window = resolveOwnedWindow();
+  if (!window) return createAgentWindow(cwd).pane;
 
-/**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
- * See https://github.com/HazAT/pi-interactive-subagents/issues/12
- *
- * Returns the new pane id (e.g. `%12`).
- */
-export function createSurface(name: string): string {
-  void name; // tmux panes are not named; the pi process inside shows its own title.
-  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  const pane = tmux([
+    "split-window", "-d", "-t", window, "-h", "-c", cwd,
+    "-P", "-F", "#{pane_id}",
+  ]);
+  if (!pane.startsWith("%")) throw new Error(`Unexpected tmux split-window output: ${pane}`);
+  markPane(pane);
+  rebalanceSurfaces(window);
+  return pane;
 }
 
-/**
- * Create a new split in the given direction from an optional source pane.
- * Returns the new pane id (e.g. `%12`).
- */
 export function createSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  void name;
-  requireTmux();
-
-  const args = ["split-window", "-d"];
-  if (direction === "left" || direction === "right") {
-    args.push("-h");
-  } else {
-    args.push("-v");
-  }
-  if (direction === "left" || direction === "up") {
-    args.push("-b");
-  }
-  if (fromSurface) {
-    args.push("-t", fromSurface);
-  }
-  args.push("-P", "-F", "#{pane_id}");
-
-  const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
-  if (!pane.startsWith("%")) {
-    throw new Error(`Unexpected tmux split-window output: ${pane}`);
-  }
-
-  rebalanceSurfaces(pane);
-  return pane;
+  void direction;
+  void fromSurface;
+  return createSurface(name);
 }
 
-/**
- * Send a command string to a pane and execute it.
- * Typed literally (`-l`) so special characters are not interpreted as keys,
- * then submitted with Enter.
- */
 export function sendCommand(surface: string, command: string): void {
   requireTmux();
-  execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
-  execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
+  tmux(["send-keys", "-t", surface, "-l", command]);
+  tmux(["send-keys", "-t", surface, "Enter"]);
 }
 
-/**
- * Send a long command to a pane by writing it to a script file first.
- * This avoids terminal line-wrapping issues that break commands exceeding the
- * pane's column width when sent character-by-character via sendCommand.
- *
- * By default the script is written to a temp directory, but callers can pass a
- * stable path (for example under session artifacts) so the exact invocation is
- * preserved for debugging.
- *
- * Returns the script path.
- */
+export function sendInterrupt(surface: string): void {
+  requireTmux();
+  tmux(["send-keys", "-t", surface, "Escape"]);
+}
+
 export function sendLongCommand(
   surface: string,
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
-  const scriptPath =
-    options?.scriptPath ??
-    join(
-      tmpdir(),
-      "pi-subagent-scripts",
-      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-    );
+  const scriptPath = options?.scriptPath ?? join(
+    tmpdir(), "pi-subagent-scripts", `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
+  );
   mkdirSync(dirname(scriptPath), { recursive: true });
-
-  const scriptParts = ["#!/bin/bash"];
-  if (options?.scriptPreamble) {
-    scriptParts.push(options.scriptPreamble.trimEnd());
-  }
-  scriptParts.push(command);
-
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
-  });
+  const parts = ["#!/bin/bash"];
+  if (options?.scriptPreamble) parts.push(options.scriptPreamble.trimEnd());
+  parts.push(command);
+  writeFileSync(scriptPath, `${parts.join("\n")}\n`, { mode: 0o755 });
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 
-/**
- * Read the screen contents of a pane (sync).
- */
 export function readScreen(surface: string, lines = 50): string {
   requireTmux();
-  return execFileSync(
-    "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-    {
-      encoding: "utf8",
-    },
-  );
+  return tmux(["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`]);
 }
 
-/**
- * Read the screen contents of a pane (async).
- */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   requireTmux();
   const { stdout } = await execFileAsync(
-    "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
+    "tmux", ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     { encoding: "utf8" },
   );
   return stdout;
 }
 
-/**
- * Close a pane.
- */
 export function closeSurface(surface: string): void {
   requireTmux();
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
-  rebalanceSurfaces();
+  if (!surfaceExists(surface)) return;
+  const window = tmux(["display-message", "-p", "-t", surface, "#{window_id}"]);
+  const owner = tmux(["show-options", "-pqv", "-t", surface, PANE_OWNER_OPTION]);
+  if (owner !== ownerToken()) return;
+  const paneCount = Number(tmux(["display-message", "-p", "-t", window, "#{window_panes}"]));
+  if (paneCount <= 1) {
+    const windowOwner = tmux(["show-options", "-wqv", "-t", window, WINDOW_OWNER_OPTION]);
+    if (windowOwner !== ownerToken()) return;
+    if (rebalanceTimer) {
+      clearTimeout(rebalanceTimer);
+      rebalanceTimer = null;
+    }
+    tmux(["kill-window", "-t", window]);
+    if (cachedWindowId === window) cachedWindowId = null;
+  } else {
+    tmux(["kill-pane", "-t", surface]);
+    rebalanceSurfaces(window);
+  }
 }
 
-// ── Exit polling ──
+export function focusAgentWindow(surface?: string): boolean {
+  requireTmux();
+  const target = surface && surfaceExists(surface) ? surface : resolveOwnedWindow();
+  if (!target) return false;
+  tmux(["select-window", "-t", target]);
+  if (surface && surfaceExists(surface)) tmux(["select-pane", "-t", surface]);
+  return true;
+}
+
+export function closeAgentWindow(): boolean {
+  requireTmux();
+  const window = resolveOwnedWindow();
+  if (!window) return false;
+  if (rebalanceTimer) {
+    clearTimeout(rebalanceTimer);
+    rebalanceTimer = null;
+  }
+  tmux(["kill-window", "-t", window]);
+  cachedWindowId = null;
+  return true;
+}
+
+export function getAgentWindowId(): string | null {
+  return resolveOwnedWindow();
+}
 
 export interface PollResult {
-  /** How the subagent exited */
   reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
-  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
 }
 
-/**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
- *
- * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
- * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
- */
 function interpretExitSidecar(data: any): PollResult {
   if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
+    const errorMessage = typeof data.errorMessage === "string" && data.errorMessage.trim()
+      ? data.errorMessage
+      : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
   return { reason: "done", exitCode: 0 };
@@ -271,11 +276,6 @@ function interpretExitSidecar(data: any): PollResult {
 
 export const __pollForExitTest__ = { interpretExitSidecar };
 
-/**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), falling back to the terminal sentinel for
- * clean-completion and crash detection.
- */
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
@@ -283,71 +283,48 @@ export async function pollForExit(
     interval: number;
     sessionFile?: string;
     sentinelFile?: string;
+    sentinelToken?: string;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
   const start = Date.now();
-
   for (;;) {
-    if (signal.aborted) {
-      throw new Error("Aborted while waiting for subagent to finish");
-    }
-
-    // Fast path: check for .exit sidecar file (written by the error path)
+    if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
     if (options.sessionFile) {
       try {
         const exitFile = `${options.sessionFile}.exit`;
         if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+          const data = JSON.parse(readFileSync(exitFile, "utf8"));
           rmSync(exitFile, { force: true });
           return interpretExitSidecar(data);
         }
       } catch {}
     }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
+    if (options.sentinelFile && existsSync(options.sentinelFile)) {
+      return { reason: "sentinel", exitCode: 0 };
     }
-
-    // Slow path: read terminal screen for sentinel (crash detection)
+    if (!surfaceExists(surface)) {
+      return { reason: "error", exitCode: 1, errorMessage: "The subagent pane was closed." };
+    }
     try {
       const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
-    } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
-    }
-
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
-
+      const token = options.sentinelToken?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = token
+        ? new RegExp(`__SUBAGENT_DONE_${token}_(\\d+)__`)
+        : /__SUBAGENT_DONE_(\d+)__/;
+      const match = screen.match(pattern);
+      if (match) return { reason: "sentinel", exitCode: Number.parseInt(match[1], 10) };
+    } catch {}
+    options.onTick?.(Math.floor((Date.now() - start) / 1000));
     await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) return reject(new Error("Aborted"));
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new Error("Aborted"));
+      };
       const timer = setTimeout(() => {
         signal.removeEventListener("abort", onAbort);
         resolve();
       }, options.interval);
-      function onAbort() {
-        clearTimeout(timer);
-        reject(new Error("Aborted"));
-      }
       signal.addEventListener("abort", onAbort, { once: true });
     });
   }

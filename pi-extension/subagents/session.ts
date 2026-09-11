@@ -96,7 +96,7 @@ export function seedSubagentSessionFile(params: {
 export interface SubagentLoadout {
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
-  /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
+  /** The concrete `--tools` allowlist used by the restricted child. Null is a legacy snapshot that cannot be resumed. */
   toolAllowlist: string | null;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
