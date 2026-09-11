@@ -2,7 +2,20 @@
 
 Async subagents for [Pi](https://github.com/badlogic/pi-mono), running in a dedicated tmux window. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**Tmux-only fork.** This repository is based on Amos Blomqvist's tmux-only fork at commit [`c3e8b53c0754ae5ccc19fdab5a7481ec039bc2f7`](https://github.com/amosblomqvist/pi-interactive-subagents/commit/c3e8b53c0754ae5ccc19fdab5a7481ec039bc2f7). See [`UPSTREAM.md`](UPSTREAM.md) for the lineage and local divergence. The inherited MIT license and attribution are retained.
+**Tmux-only fork.** This repository is based on Amos Blomqvist's tmux-only fork at commit [`c3e8b53c0754ae5ccc19fdab5a7481ec039bc2f7`](https://github.com/amosblomqvist/pi-interactive-subagents/commit/c3e8b53c0754ae5ccc19fdab5a7481ec039bc2f7). The inherited MIT license and attribution are retained.
+
+## What this fork adds
+
+Compared with the upstream commit above, this fork adds or changes:
+
+- **Dedicated tmux workspace:** children run in an owned `pi-agents` window with tiled panes, detached creation, focus preservation, ownership checks, cleanup, and lazy recreation. It never splits or rearranges the user's Pi window.
+- **Window controls:** `/agents` commands, `Ctrl+Shift+A`, and `subagent_interrupt` make it possible to focus, stop, or close the child workspace without deleting sessions.
+- **Reliable lifecycle handling:** runtime watcher state is restored after a Pi restart, and per-run completion sentinels prevent stale terminal output from completing a newer child.
+- **Tool and extension isolation:** every child receives an explicit tool allowlist; resumes replay the captured restrictions and refuse legacy snapshots that could relaunch unrestricted.
+- **Current Pi integration:** the code uses the `@earendil-works/pi-*` packages and Pi 0.84 APIs, with local OpenAI Codex agent profiles and `pi-web-access` support.
+- **Regression coverage:** focused tests cover tmux ownership, focus preservation, cleanup/recreation, sentinel isolation, and tool restrictions.
+
+See [`UPSTREAM.md`](UPSTREAM.md) for the full lineage and change notes.
 
 ## How it works
 
@@ -72,9 +85,9 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 - **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
-Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
+Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates restricted resume.
 
-**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+**Resume replays the original restrictions.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the same restricted process from that snapshot rather than relaunching unrestricted.
 
 ### ask_question
 
@@ -150,7 +163,7 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Access is **whitelist-only at the Pi tool/extension level**—this is not an OS or container sandbox. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
@@ -198,17 +211,7 @@ tmux new -A -s pi 'pi'
 
 This is a fork of [Amos Blomqvist's `pi-interactive-subagents`](https://github.com/amosblomqvist/pi-interactive-subagents), based on commit [`c3e8b53c0754ae5ccc19fdab5a7481ec039bc2f7`](https://github.com/amosblomqvist/pi-interactive-subagents/commit/c3e8b53c0754ae5ccc19fdab5a7481ec039bc2f7). That project is itself derived from [HazAT's original project](https://github.com/HazAT/pi-interactive-subagents). See [`UPSTREAM.md`](UPSTREAM.md) for the full lineage and the local change summary.
 
-This fork retains the upstream lifecycle, session, supervision, sandbox/loadout, messaging, and widget architecture while adding or changing:
-
-- migration to `@earendil-works/pi-*` and Pi 0.84 APIs;
-- a dedicated, owned `pi-agents` window instead of splitting the parent window;
-- stable tmux window/pane ownership, detached creation, focus preservation, cleanup, and lazy recreation;
-- runtime watcher restoration and collision-resistant completion sentinels;
-- local OpenAI Codex agent profiles and `pi-web-access` integration;
-- `/agents` management commands and child interruption; and
-- focused tmux ownership, focus, cleanup, recreation, and sentinel tests.
-
-The upstream supervision features were inspired by [RepoPrompt](https://repoprompt.com/). Credit for inherited code and design belongs to the upstream authors and contributors; local modifications are maintained in this fork.
+This fork retains the upstream lifecycle, session, supervision, tool-loadout, messaging, and widget architecture. The upstream supervision features were inspired by [RepoPrompt](https://repoprompt.com/). Credit for inherited code and design belongs to the upstream authors and contributors; local modifications are maintained in this fork.
 
 ## License
 
