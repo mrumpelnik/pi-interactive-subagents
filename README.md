@@ -190,13 +190,20 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
+Status display is configured via `~/.pi/agent/pi-subagents/config.json` (or the directory selected by `PI_CODING_AGENT_DIR`). The checked-in `config.json.example` is used as the default when no user config exists:
+
+```bash
+mkdir -p ~/.pi/agent/pi-subagents
+cp config.json.example ~/.pi/agent/pi-subagents/config.json
+```
 
 ```json
 {
   "status": { "enabled": true }
 }
 ```
+
+Keep the user config outside this extension checkout: `pi update --extensions` cleans ignored files from the checkout, including the old `pi-extension/subagents/config.json` location.
 
 ## Requirements
 

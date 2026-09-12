@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
@@ -8,8 +9,12 @@ export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
 
 const EXTENSION_ROOT = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_STATUS_CONFIG_PATH = join(EXTENSION_ROOT, "config.json");
-const STATUS_CONFIG_EXAMPLE_PATH = DEFAULT_STATUS_CONFIG_PATH;
+// Keep user configuration outside pi's git-managed package checkout. `pi
+// update` resets that checkout and removes ignored files, which used to delete
+// the extension-local config.json on every update.
+const AGENT_CONFIG_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+const DEFAULT_STATUS_CONFIG_PATH = join(AGENT_CONFIG_DIR, "pi-subagents", "config.json");
+const STATUS_CONFIG_EXAMPLE_PATH = join(EXTENSION_ROOT, "..", "..", "config.json.example");
 
 export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
 export type SubagentStatusSource = "pi" | "claude";
