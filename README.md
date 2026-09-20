@@ -19,7 +19,7 @@ See [`UPSTREAM.md`](UPSTREAM.md) for the full lineage and change notes.
 
 ## How it works
 
-`subagent()` returns immediately. The first child creates an owned, lazily created `pi-agents` tmux window; later children use tiled panes in that window. Creation is detached and never steals keyboard focus. The window is identified by stable tmux window/pane IDs and ownership options, so unrelated user windows are not modified. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The first child creates an owned, lazily created `pi-agents` tmux window; later children (including nested descendants) use tiled panes in that same window. Creation is detached and never steals keyboard focus, and a cross-process claim lock prevents simultaneous creators from making duplicates. A stable root ownership token is propagated through child environments; stable tmux window/pane IDs and ownership options keep unrelated user windows untouched. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -30,7 +30,7 @@ See [`UPSTREAM.md`](UPSTREAM.md) for the full lineage and change notes.
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept tiled: the extension re-applies the `tiled` layout after every spawn and exit (debounced). The dedicated window closes after its final child exits and is recreated lazily by the next spawn. `/agents close-window` only closes a window owned by the current parent Pi pane.
+Panes are kept tiled: the extension re-applies the `tiled` layout after every spawn and exit (debounced). The dedicated window closes after its final child exits and is recreated lazily by the next spawn. `/agents close-window` only closes a window owned by the current root subagent tree.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 

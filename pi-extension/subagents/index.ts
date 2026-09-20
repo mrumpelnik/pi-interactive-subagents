@@ -19,6 +19,8 @@ import {
   isMuxAvailable,
   muxSocketPath,
   muxSetupHint,
+  muxOwnerToken,
+  ROOT_OWNER_ENV,
   createSurface,
   sendCommand,
   sendLongCommand,
@@ -497,6 +499,11 @@ function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
+/** Propagate the root tmux-window owner to every descendant Pi process. */
+function muxOwnerEnvPart(): string {
+  return `${ROOT_OWNER_ENV}=${shellEscape(muxOwnerToken())}`;
 }
 
 function muxUnavailableResult() {
@@ -1166,6 +1173,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
+  muxOwnerEnvPart,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1315,7 +1323,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_${id}_'$?'__'`;
+    const command = `${cdPrefix}${muxOwnerEnvPart()} ${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_${id}_'$?'__'`;
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1405,8 +1413,10 @@ async function launchSubagent(
   // the shared helper (same code path resume uses — they can't drift).
   applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
 
-  // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
+  // Build env prefix: root tmux ownership + subagent identity + config dir
+  // propagation + spawn allowlist. The root token is intentionally explicit so
+  // nested children do not claim a window using their own pane id.
+  const envParts: string[] = [muxOwnerEnvPart()];
 
   if (resolvedAgentDir) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
@@ -1711,9 +1721,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     );
     const restored = restoreRuntimeRegistry();
     if (restored.length === 0) {
-      // Clean up an empty window left by an older extension version that kept
-      // its final shell pane alive. Future windows close with their last child.
-      try { closeAgentWindow(); } catch {}
+      // Only the root Pi session may clean up an empty owned window. Child
+      // sessions share the root owner token; letting one of them run this
+      // legacy cleanup would kill the parent's still-active window.
+      if (!process.env[ROOT_OWNER_ENV]) {
+        // Clean up an empty window left by an older extension version that kept
+        // its final shell pane alive. Future windows close with their last child.
+        try { closeAgentWindow(); } catch {}
+      }
     } else {
       startWidgetRefresh();
       startStatusRefresh(pi);
@@ -2301,8 +2316,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
         // so the resumed process resolves the same agents/extensions and keeps
-        // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
+        // the same nested-spawn restriction it originally ran with. The root tmux
+        // owner is also replayed so resumed descendants reuse the same window.
+        const resumeEnvParts: string[] = [muxOwnerEnvPart()];
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
         if (resumeAgentDir) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);

@@ -1,5 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -9,6 +10,10 @@ const SUBAGENT_TMUX_LAYOUT = "tiled";
 const WINDOW_NAME = "pi-agents";
 const WINDOW_OWNER_OPTION = "@pi_subagents_owner";
 const PANE_OWNER_OPTION = "@pi_subagent_owned";
+/** Propagated through child shells so every descendant shares its root window. */
+export const ROOT_OWNER_ENV = "PI_SUBAGENT_ROOT_OWNER";
+const WINDOW_LOCK_TIMEOUT_MS = 10_000;
+const WINDOW_LOCK_RETRY_MS = 10;
 const commandAvailability = new Map<string, boolean>();
 let cachedWindowId: string | null = null;
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -59,8 +64,128 @@ function parentPane(): string {
   return process.env.TMUX_PANE!;
 }
 
+/**
+ * Return the root owner for this subagent tree. The first process derives it
+ * from its own pane; descendants receive the value in ROOT_OWNER_ENV and must
+ * not substitute their own (nested) pane id.
+ */
 function ownerToken(): string {
-  return parentPane();
+  return process.env[ROOT_OWNER_ENV]?.trim() || parentPane();
+}
+
+/** The owner token to put in a child launch environment. */
+export function muxOwnerToken(): string {
+  requireTmux();
+  return ownerToken();
+}
+
+function sleepSync(milliseconds: number): void {
+  // createSurface is intentionally synchronous. Atomics.wait gives us a
+  // bounded sleep without spawning a shell while another process owns the
+  // lock.
+  const blocker = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(blocker, 0, 0, milliseconds);
+}
+
+function windowLockPath(): string {
+  const key = createHash("sha256")
+    .update(`${muxSocketPath() ?? ""}\0${ownerToken()}`)
+    .digest("hex");
+  return join(tmpdir(), "pi-subagents-tmux-locks", `${key}.lock`);
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    // EPERM means the process exists but cannot be signalled by us.
+    return error?.code === "EPERM";
+  }
+}
+
+/**
+ * Reap a lock left by a process that died in the critical section. Rename is
+ * used instead of remove so an arriving process never removes a lock that was
+ * freshly acquired after our stale check.
+ */
+function reapStaleWindowLock(lockPath: string): boolean {
+  let pid: number;
+  try {
+    const owner = readFileSync(join(lockPath, "owner"), "utf8").trim();
+    pid = Number.parseInt(owner.split("-", 1)[0] ?? "", 10);
+  } catch {
+    return false;
+  }
+  if (!Number.isFinite(pid) || pid <= 0 || processIsAlive(pid)) return false;
+
+  const stalePath = `${lockPath}.stale-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+  try {
+    renameSync(lockPath, stalePath);
+    // A different process may have released the old lock and acquired this
+    // path between our read and rename. Never delete that live replacement.
+    let movedPid = 0;
+    try {
+      const movedOwner = readFileSync(join(stalePath, "owner"), "utf8").trim();
+      movedPid = Number.parseInt(movedOwner.split("-", 1)[0] ?? "", 10);
+    } catch {}
+    if (movedPid <= 0 || processIsAlive(movedPid)) {
+      try { renameSync(stalePath, lockPath); } catch {}
+      return false;
+    }
+    rmSync(stalePath, { recursive: true, force: true });
+    return true;
+  } catch {
+    // Another waiter may have reaped or released it first.
+    return false;
+  }
+}
+
+/**
+ * Serialize owned-window discovery and creation across all Pi processes in a
+ * root tree. resolveOwnedWindow() followed by new-window is otherwise a
+ * classic check/create race when sibling or nested Pi processes start at once.
+ */
+function withWindowLock<T>(operation: () => T): T {
+  requireTmux();
+  const lockPath = windowLockPath();
+  mkdirSync(dirname(lockPath), { recursive: true });
+
+  const lockOwner = `${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
+  const started = Date.now();
+  for (;;) {
+    let acquired = false;
+    try {
+      mkdirSync(lockPath);
+      acquired = true;
+      writeFileSync(join(lockPath, "owner"), `${lockOwner}\n`, { flag: "wx" });
+      break;
+    } catch (error: any) {
+      if (acquired) {
+        rmSync(lockPath, { recursive: true, force: true });
+        throw error;
+      }
+      if (error?.code !== "EEXIST") throw error;
+      if (reapStaleWindowLock(lockPath)) continue;
+      if (Date.now() - started >= WINDOW_LOCK_TIMEOUT_MS) {
+        throw new Error("Timed out waiting for the pi-agents tmux window lock");
+      }
+      sleepSync(WINDOW_LOCK_RETRY_MS);
+    }
+  }
+
+  try {
+    return operation();
+  } finally {
+    // A stale-lock reaper can move this directory while a PID is being
+    // recycled. Only remove the directory if its ownership marker is still
+    // ours; never delete a replacement lock acquired by another process.
+    try {
+      if (readFileSync(join(lockPath, "owner"), "utf8").trim() === lockOwner) {
+        rmSync(lockPath, { recursive: true, force: true });
+      }
+    } catch {}
+  }
 }
 
 export function surfaceExists(pane: string): boolean {
@@ -145,17 +270,19 @@ function rebalanceSurfaces(windowHint?: string): void {
 export function createSurface(name: string, cwd = process.cwd()): string {
   void name;
   requireTmux();
-  const window = resolveOwnedWindow();
-  if (!window) return createAgentWindow(cwd).pane;
+  return withWindowLock(() => {
+    const window = resolveOwnedWindow();
+    if (!window) return createAgentWindow(cwd).pane;
 
-  const pane = tmux([
-    "split-window", "-d", "-t", window, "-h", "-c", cwd,
-    "-P", "-F", "#{pane_id}",
-  ]);
-  if (!pane.startsWith("%")) throw new Error(`Unexpected tmux split-window output: ${pane}`);
-  markPane(pane);
-  rebalanceSurfaces(window);
-  return pane;
+    const pane = tmux([
+      "split-window", "-d", "-t", window, "-h", "-c", cwd,
+      "-P", "-F", "#{pane_id}",
+    ]);
+    if (!pane.startsWith("%")) throw new Error(`Unexpected tmux split-window output: ${pane}`);
+    markPane(pane);
+    rebalanceSurfaces(window);
+    return pane;
+  });
 }
 
 export function createSurfaceSplit(
@@ -212,24 +339,28 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 
 export function closeSurface(surface: string): void {
   requireTmux();
-  if (!surfaceExists(surface)) return;
-  const window = tmux(["display-message", "-p", "-t", surface, "#{window_id}"]);
-  const owner = tmux(["show-options", "-pqv", "-t", surface, PANE_OWNER_OPTION]);
-  if (owner !== ownerToken()) return;
-  const paneCount = Number(tmux(["display-message", "-p", "-t", window, "#{window_panes}"]));
-  if (paneCount <= 1) {
-    const windowOwner = tmux(["show-options", "-wqv", "-t", window, WINDOW_OWNER_OPTION]);
-    if (windowOwner !== ownerToken()) return;
-    if (rebalanceTimer) {
-      clearTimeout(rebalanceTimer);
-      rebalanceTimer = null;
+  withWindowLock(() => {
+    // Re-check after acquiring the lock: a concurrent creator or cleaner may
+    // have changed the pane topology since the caller first observed it.
+    if (!surfaceExists(surface)) return;
+    const window = tmux(["display-message", "-p", "-t", surface, "#{window_id}"]);
+    const owner = tmux(["show-options", "-pqv", "-t", surface, PANE_OWNER_OPTION]);
+    if (owner !== ownerToken()) return;
+    const paneCount = Number(tmux(["display-message", "-p", "-t", window, "#{window_panes}"]));
+    if (paneCount <= 1) {
+      const windowOwner = tmux(["show-options", "-wqv", "-t", window, WINDOW_OWNER_OPTION]);
+      if (windowOwner !== ownerToken()) return;
+      if (rebalanceTimer) {
+        clearTimeout(rebalanceTimer);
+        rebalanceTimer = null;
+      }
+      tmux(["kill-window", "-t", window]);
+      if (cachedWindowId === window) cachedWindowId = null;
+    } else {
+      tmux(["kill-pane", "-t", surface]);
+      rebalanceSurfaces(window);
     }
-    tmux(["kill-window", "-t", window]);
-    if (cachedWindowId === window) cachedWindowId = null;
-  } else {
-    tmux(["kill-pane", "-t", surface]);
-    rebalanceSurfaces(window);
-  }
+  });
 }
 
 export function focusAgentWindow(surface?: string): boolean {
@@ -243,15 +374,17 @@ export function focusAgentWindow(surface?: string): boolean {
 
 export function closeAgentWindow(): boolean {
   requireTmux();
-  const window = resolveOwnedWindow();
-  if (!window) return false;
-  if (rebalanceTimer) {
-    clearTimeout(rebalanceTimer);
-    rebalanceTimer = null;
-  }
-  tmux(["kill-window", "-t", window]);
-  cachedWindowId = null;
-  return true;
+  return withWindowLock(() => {
+    const window = resolveOwnedWindow();
+    if (!window) return false;
+    if (rebalanceTimer) {
+      clearTimeout(rebalanceTimer);
+      rebalanceTimer = null;
+    }
+    tmux(["kill-window", "-t", window]);
+    cachedWindowId = null;
+    return true;
+  });
 }
 
 export function getAgentWindowId(): string | null {

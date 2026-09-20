@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import {
   closeAgentWindow,
   closeSurface,
@@ -10,8 +11,10 @@ import {
   pollForExit,
   sendCommand,
   surfaceExists,
+  ROOT_OWNER_ENV,
 } from "../pi-extension/subagents/tmux.ts";
 
+const execFileAsync = promisify(execFile);
 const tmux = (...args: string[]) => execFileSync("tmux", args, { encoding: "utf8" }).trim();
 const parentPane = process.env.TMUX_PANE!;
 const parentWindow = tmux("display-message", "-p", "-t", parentPane, "#{window_id}");
@@ -55,6 +58,70 @@ test("creates, closes, and reopens a detached owned window without stealing focu
   assert.notEqual(getAgentWindowId(), agentWindow);
   assert.equal(focusAgentWindow(reopened), true);
   assert.equal(tmux("display-message", "-p", "#{pane_id}"), reopened);
+});
+
+test("uses the propagated root owner for nested surfaces", async () => {
+  const rootOwner = `root-owner-${process.pid}`;
+  const modulePath = new URL("../pi-extension/subagents/tmux.ts", import.meta.url).pathname;
+  const createScript = [
+    `import { createSurface } from ${JSON.stringify(modulePath)};`,
+    "process.stdout.write(createSurface('nested', process.cwd()));",
+  ].join(" ");
+  const childEnv = { ...process.env, [ROOT_OWNER_ENV]: rootOwner };
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    ["--input-type=module", "-e", createScript],
+    { env: childEnv },
+  );
+  const surface = stdout.trim();
+  const window = tmux("display-message", "-p", "-t", surface, "#{window_id}");
+  assert.ok(window.startsWith("@"));
+  assert.equal(tmux("show-options", "-wqv", "-t", window, "@pi_subagents_owner"), rootOwner);
+
+  const closeScript = [
+    `import { closeSurface } from ${JSON.stringify(modulePath)};`,
+    `closeSurface(${JSON.stringify(surface)});`,
+  ].join(" ");
+  await execFileAsync(process.execPath, ["--input-type=module", "-e", closeScript], { env: childEnv });
+  assert.equal(surfaceExists(surface), false);
+});
+
+test("serializes concurrent claims of the root window", async () => {
+  const rootOwner = `race-owner-${process.pid}`;
+  const modulePath = new URL("../pi-extension/subagents/tmux.ts", import.meta.url).pathname;
+  const script = [
+    `import { createSurface } from ${JSON.stringify(modulePath)};`,
+    "process.stdout.write(createSurface('race', process.cwd()));",
+  ].join(" ");
+  const childEnv = { ...process.env, [ROOT_OWNER_ENV]: rootOwner };
+  const children = Array.from({ length: 8 }, () =>
+    execFileAsync(process.execPath, ["--input-type=module", "-e", script], { env: childEnv }),
+  );
+  let surfaces: string[] = [];
+
+  try {
+    const results = await Promise.all(children);
+    surfaces = results.map(({ stdout }) => stdout.trim()).filter(Boolean);
+    assert.equal(surfaces.length, 8);
+    const session = tmux("display-message", "-p", "-t", parentPane, "#{session_id}");
+    const rows = tmux("list-windows", "-t", session, "-F", "#{window_id}\t#{@pi_subagents_owner}")
+      .split("\n")
+      .filter((row) => row.split("\t")[1] === rootOwner);
+    assert.equal(rows.length, 1, "all concurrent creators must claim one owned window");
+  } finally {
+    const cleanupScript = [
+      `import { closeSurface, closeAgentWindow } from ${JSON.stringify(modulePath)};`,
+      `for (const surface of ${JSON.stringify(surfaces)}) closeSurface(surface);`,
+      "closeAgentWindow();",
+    ].join(" ");
+    try {
+      await execFileAsync(process.execPath, ["--input-type=module", "-e", cleanupScript], { env: childEnv });
+    } catch {}
+  }
+  const remaining = tmux("list-windows", "-t", tmux("display-message", "-p", "-t", parentPane, "#{session_id}"), "-F", "#{@pi_subagents_owner}")
+    .split("\n")
+    .filter((owner) => owner === rootOwner);
+  assert.equal(remaining.length, 0);
 });
 
 test("ignores stale completion sentinels from earlier runs", async () => {
