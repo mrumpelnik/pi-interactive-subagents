@@ -140,7 +140,6 @@ You are a specialized agent that does X...
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
-| `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
 
 ### session-mode
 
@@ -171,13 +170,13 @@ Extensions can register additional tools for sub-agents at runtime via `register
 
 ## Role folders
 
-`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (CLAUDE.md, skills, extensions) apply:
+`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (AGENTS.md, skills, extensions) apply:
 
 ```
 project/
 └── agents/
-    ├── game-designer/   ← CLAUDE.md, .pi/…
-    └── sre/             ← CLAUDE.md, .pi/…
+    ├── game-designer/   ← AGENTS.md, .pi/…
+    └── sre/             ← AGENTS.md, .pi/…
 ```
 
 ```typescript

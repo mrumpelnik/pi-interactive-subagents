@@ -415,7 +415,6 @@ export async function pollForExit(
   options: {
     interval: number;
     sessionFile?: string;
-    sentinelFile?: string;
     sentinelToken?: string;
     onTick?: (elapsed: number) => void;
   },
@@ -432,9 +431,6 @@ export async function pollForExit(
           return interpretExitSidecar(data);
         }
       } catch {}
-    }
-    if (options.sentinelFile && existsSync(options.sentinelFile)) {
-      return { reason: "sentinel", exitCode: 0 };
     }
     if (!surfaceExists(surface)) {
       return { reason: "error", exitCode: 1, errorMessage: "The subagent pane was closed." };
