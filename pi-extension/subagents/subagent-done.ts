@@ -4,7 +4,7 @@
  * - Provides an `ask_question` tool for asking the parent orchestrator a question
  *
  * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
- * automatically when their agent loop ends (see the `agent_end` handler);
+ * automatically when their agent run settles (see the `agent_settled` handler);
  * interactive agents end when the human exits the pane.
  *
  * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
@@ -13,7 +13,7 @@
  * replies with subagent_message — which lands as the subagent's next turn.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, Text, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
@@ -29,9 +29,9 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
  * children (e.g. a worker delegating to scout/researcher), `index.ts` runs in
  * the same process and publishes a live count through a shared process-global
  * symbol. A subagent that spawns children and then writes a "waiting for
- * results" message would otherwise auto-exit the instant that turn ends —
+ * results" message would otherwise auto-exit as soon as that run settles —
  * killing the session before its children report back. Reading this count lets
- * `agent_end` keep the session open until every child has finished and its
+ * `agent_settled` keep the session open until every child has finished and its
  * result has been delivered.
  *
  * Returns 0 when the spawning tools aren't loaded (scout/researcher, or a
@@ -48,7 +48,7 @@ export function runningChildrenCount(): number {
   }
 }
 
-export function shouldAutoExitOnAgentEnd(
+export function shouldAutoExitOnAgentSettled(
   _userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
@@ -84,7 +84,7 @@ export interface SubagentErrorInfo {
  * failure instead of silently treating the run as completed.
  *
  * Returns `null` when the latest assistant turn completed normally or was
- * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ * aborted by the user (handled separately by shouldAutoExitOnAgentSettled).
  */
 export function findLatestAssistantError(
   messages: any[] | undefined,
@@ -102,6 +102,9 @@ export function findLatestAssistantError(
   }
   return null;
 }
+
+// Kept as a compatibility alias for callers that used the old lifecycle name.
+export const shouldAutoExitOnAgentEnd = shouldAutoExitOnAgentSettled;
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
@@ -179,13 +182,38 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   // Set when ask_question is called; suppresses auto-exit so the session stays
-  // open while it waits for the orchestrator's reply. Cleared when the reply
-  // lands — on `input` (covers a reply steered into the current run) and on
-  // `agent_start` (covers a reply that starts a fresh turn after parking).
+  // open while it waits for the orchestrator's reply. Cleared only when the
+  // reply lands on `input` (including a reply steered into the current run).
+  // Automatic retry agent_start events must not clear this flag.
   let awaitingAnswer = false;
+  // `agent_end` can be followed by an automatic retry, compaction, or queued
+  // continuation. Keep only the latest low-level run's messages so the final
+  // `agent_settled` decision reports the outcome Pi actually settled on.
+  let latestAgentMessages: any[] | undefined;
+  // An error agent_end is provisional while Pi may be in retry backoff. Escape
+  // aborts that backoff without producing an "aborted" assistant message, so
+  // remember the cancellation and avoid reporting the stale error as final.
+  let retryMayBePending = false;
+  let cancellationRequested = false;
+  let runGeneration = 0;
+  let removeTerminalInputListener: (() => void) | undefined;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    removeTerminalInputListener?.();
+    // Escape is handled by Pi's retry-specific editor handler during retry
+    // backoff, not by the agent abort signal. Observe the raw key so that the
+    // later agent_settled event does not mistake that stale retry error for a
+    // final provider failure. This is a no-op outside interactive TUI mode.
+    if (typeof ctx.ui.onTerminalInput === "function") {
+      removeTerminalInputListener = ctx.ui.onTerminalInput((data) => {
+        const isIdle = typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
+        if (retryMayBePending && !isIdle && matchesKey(data, "escape")) {
+          cancellationRequested = true;
+        }
+      });
+    }
+
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -201,7 +229,7 @@ export default function (pi: ExtensionAPI) {
     // here, not only on agent_start, because a reply steered in *mid-run* is
     // absorbed into the current run (pi's `steer` behavior injects it before
     // the next LLM call): no new agent_start fires, so without this the flag
-    // would stay set and agent_end would park the session as `waiting` even
+    // would stay set and agent_settled would park the session as `waiting` even
     // though the answer already arrived and was consumed. (The `input` event
     // fires for mid-run steers because prompt() emits it before queueing.)
     awaitingAnswer = false;
@@ -215,16 +243,49 @@ export default function (pi: ExtensionAPI) {
     recorder.beforeAgentStart();
   });
 
-  pi.on("agent_start", () => {
+  pi.on("agent_start", (_event, ctx) => {
     agentStarted = true;
-    // A new turn is starting — any pending ask_question has now been answered
-    // (or superseded), so let auto-exit resume normally when this turn ends.
-    awaitingAnswer = false;
+    // A new turn may be an automatic retry. Only `input` proves that an
+    // ask_question reply arrived; do not clear awaitingAnswer here.
+    latestAgentMessages = undefined;
+    retryMayBePending = false;
+    cancellationRequested = false;
+    const generation = ++runGeneration;
+    const signal = ctx?.signal;
+    if (signal) {
+      if (signal.aborted) {
+        cancellationRequested = true;
+      } else {
+        signal.addEventListener(
+          "abort",
+          () => {
+            if (generation === runGeneration) cancellationRequested = true;
+          },
+          { once: true },
+        );
+      }
+    }
     recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
+    // Pi may retry, compact, or continue after agent_end. Do not shut down or
+    // create an error sidecar here; record the candidate messages and wait for
+    // agent_settled to make the final decision.
+    latestAgentMessages = (event as any).messages as any[] | undefined;
+    retryMayBePending = latestAgentMessages?.some(
+      (message) => message?.role === "assistant" && message.stopReason === "error",
+    ) ?? false;
+    if (ctx?.signal?.aborted) cancellationRequested = true;
+    recorder.agentEndWaiting();
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    // A settled handler can race with another extension that starts a new run.
+    // Never perform terminal sidecar/shutdown handling once that run is active.
+    if (typeof ctx.isIdle === "function" && !ctx.isIdle()) return;
+
+    const messages = latestAgentMessages;
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
     //  - runningChildrenCount(): this subagent spawned its own children and is
@@ -236,8 +297,9 @@ export default function (pi: ExtensionAPI) {
     const shouldExit =
       !awaitingAnswer &&
       !hasPendingChildren &&
+      !cancellationRequested &&
       autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+      shouldAutoExitOnAgentSettled(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -263,12 +325,12 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      recorder.agentEndDone();
+      recorder.agentSettledDone();
       ctx.shutdown();
       return;
     }
 
-    recorder.agentEndWaiting();
+    recorder.agentSettledWaiting();
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
@@ -317,6 +379,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    removeTerminalInputListener?.();
+    removeTerminalInputListener = undefined;
     recorder.sessionShutdown((event as any).reason);
   });
 

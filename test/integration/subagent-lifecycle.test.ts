@@ -238,35 +238,33 @@ for (const backend of backends) {
       }
     });
 
-    // ── caller_ping ──
+    // ── ask_question ──
 
-    it("subagent caller_ping sends notification back to the parent", async () => {
+    it("subagent ask_question sends a notification back to the parent", async () => {
       const id = uniqueId();
 
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const surface = createTrackedSurface(env, `question-${id}`);
       await sleep(1000);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
-        `  task: "PING_TEST_${id}"`,
+        `  name: "Question-${id}"`,
+        `  agent: "test-question"`,
+        `  task: "QUESTION_TEST_${id}"`,
         `Just call the subagent tool once. Do not do anything else before calling it.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      // The test-ping agent calls caller_ping, which steers a "needs help" message
-      // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(
-        surface,
-        /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
-      );
+      // Match the exact unique question so the original parent prompt cannot
+      // satisfy the assertion by itself.
+      const question = `QUESTION_FROM_AGENT: QUESTION_TEST_${id}`;
+      const screen = await waitForScreen(surface, new RegExp(question), PI_TIMEOUT);
 
-      assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
+      assert.match(
+        screen,
+        new RegExp(`Sub-agent .* asks[\\s\\S]*${question}`),
+        `Screen should show the ask_question notification. Got:\n${screen.slice(-800)}`,
       );
     });
 

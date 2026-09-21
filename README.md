@@ -152,7 +152,7 @@ You are a specialized agent that does X...
 
 ### auto-exit
 
-With `auto-exit: true`, the session shuts down when the agent's turn ends — the agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
+With `auto-exit: true`, the session shuts down when the agent run settles — after Pi has finished any retries or queued follow-ups. The agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
 
 Notes:
 

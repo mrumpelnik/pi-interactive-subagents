@@ -51,6 +51,7 @@ import {
 } from "../pi-extension/subagents/activity.ts";
 import {
   shouldMarkUserTookOver,
+  shouldAutoExitOnAgentSettled,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   runningChildrenCount,
@@ -815,7 +816,7 @@ describe("status.ts", () => {
       sequence: 1,
       phase: "waiting",
       waitingSince: 10_000,
-      latestEvent: "agent_end",
+      latestEvent: "agent_settled",
     }, 10_000);
 
     const snapshot = classifyStatus(state, 240_000);
@@ -837,7 +838,7 @@ describe("status.ts", () => {
       sequence: 1,
       phase: "waiting",
       waitingSince: 96_000,
-      latestEvent: "agent_end",
+      latestEvent: "agent_settled",
     }, 96_000);
     advanced = advanceStatusState(state, 97_000);
     assert.equal(advanced.transition, "recovered");
@@ -907,12 +908,12 @@ describe("status.ts", () => {
       sequence: 3,
       phase: "waiting",
       waitingSince: 10_000,
-      latestEvent: "agent_end",
+      latestEvent: "agent_settled",
     }, 10_001);
 
     const snapshot = classifyStatus(state, 11_000);
     assert.equal(snapshot.kind, "waiting");
-    assert.equal(snapshot.latestEvent, "agent_end");
+    assert.equal(snapshot.latestEvent, "agent_settled");
   });
 
   it("recovers from a transient snapshot read failure with the same valid snapshot", () => {
@@ -1556,28 +1557,33 @@ describe("subagent-done.ts", () => {
     });
   });
 
-  describe("shouldAutoExitOnAgentEnd", () => {
+  describe("shouldAutoExitOnAgentSettled", () => {
+    it("retains shouldAutoExitOnAgentEnd as a compatibility alias", () => {
+      assert.equal(shouldAutoExitOnAgentEnd, shouldAutoExitOnAgentSettled);
+      assert.equal(
+        shouldAutoExitOnAgentEnd(false, [{ role: "assistant", stopReason: "stop" }]),
+        true,
+      );
+    });
+
     it("auto-exits after normal completion when there was no takeover", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+      assert.equal(shouldAutoExitOnAgentSettled(false, messages), true);
     });
 
     it("auto-exits after normal completion even when the user sent the prompt", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), true);
+      assert.equal(shouldAutoExitOnAgentSettled(true, messages), true);
     });
 
     it("stays open after Escape aborts the run", () => {
       const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+      assert.equal(shouldAutoExitOnAgentSettled(false, messages), false);
     });
 
-    it("still exits when the latest turn ended with stopReason=error", () => {
-      // Auto-exit subagents must shut down on retry-exhaustion errors so the
-      // parent is woken. The error sidecar (written separately) carries the
-      // failure detail; staying open would just strand the worker.
+    it("exits on a settled stopReason=error for final error reporting", () => {
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+      assert.equal(shouldAutoExitOnAgentSettled(false, messages), true);
     });
   });
 
@@ -1726,6 +1732,7 @@ describe("subagent-done.ts", () => {
     function setupCapturingExtension(sessionFile: string) {
       const handlers = new Map<string, Array<(...args: any[]) => void>>();
       const tools: any[] = [];
+      let terminalInputHandler: ((data: string) => unknown) | undefined;
       const api = {
         on(event: string, handler: (...args: any[]) => void) {
           if (!handlers.has(event)) handlers.set(event, []);
@@ -1758,7 +1765,17 @@ describe("subagent-done.ts", () => {
         const tool = tools.find((t) => t.name === "ask_question");
         await tool.execute("c1", { question: "v1 or v2?" }, undefined, undefined, { shutdown() {} });
       };
-      return { emit, ask, restore };
+      return {
+        emit,
+        ask,
+        restore,
+        emitTerminalInput(data: string) {
+          terminalInputHandler?.(data);
+        },
+        installTerminalInputHandler(handler: (data: string) => unknown) {
+          terminalInputHandler = handler;
+        },
+      };
     }
 
     it("exits (does not park) when the reply arrives mid-run via input", async () => {
@@ -1770,8 +1787,11 @@ describe("subagent-done.ts", () => {
         // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
         emit("input");
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
-        assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
+        const ctx = { shutdown() { shutdown = true; } };
+        emit("agent_end", { messages: [] }, ctx);
+        assert.equal(shutdown, false, "agent_end must never shut down before settlement");
+        emit("agent_settled", {}, ctx);
+        assert.equal(shutdown, true, "reply consumed mid-run → settled run should exit");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -1786,30 +1806,206 @@ describe("subagent-done.ts", () => {
         await ask();
         // No input yet — the orchestrator has not replied.
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
-        assert.equal(shutdown, false, "pending question with no reply must park, not exit");
+        const ctx = { shutdown() { shutdown = true; } };
+        emit("agent_end", { messages: [] }, ctx);
+        assert.equal(shutdown, false, "pending question must not shut down at agent_end");
+        emit("agent_settled", {}, ctx);
+        assert.equal(shutdown, false, "pending question must park at settlement, not exit");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
       }
     });
 
-    it("exits when the reply arrives as a new turn (agent_start also clears the flag)", async () => {
+    it("exits when the reply arrives as a new turn (input clears the flag first)", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
       try {
         emit("agent_start");
         await ask();
         let shutdown1 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown1 = true; } });
+        const ctx1 = { shutdown() { shutdown1 = true; } };
+        emit("agent_end", { messages: [] }, ctx1);
+        assert.equal(shutdown1, false, "agent_end must not shut down while waiting");
+        emit("agent_settled", {}, ctx1);
         assert.equal(shutdown1, false, "parks while waiting");
         // Reply arrives as a fresh turn after the subagent had parked.
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
-        assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
+        const ctx2 = { shutdown() { shutdown2 = true; } };
+        emit("agent_end", { messages: [] }, ctx2);
+        assert.equal(shutdown2, false, "new turn still waits for settlement");
+        emit("agent_settled", {}, ctx2);
+        assert.equal(shutdown2, true, "after the reply turn, settled run should exit");
       } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("retains a pending question across automatic retry agent_start events", async () => {
+      const dir = createTestDir();
+      const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
+      try {
+        emit("agent_start");
+        await ask();
+
+        // The retry starts a fresh low-level run without an input/reply event.
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "error", errorMessage: "transient overload" }],
+        }, { shutdown() {} });
+        emit("agent_start");
+        emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, { shutdown() {} });
+        let shutdown = false;
+        emit("agent_settled", {}, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, false, "automatic retry must not consume the pending question");
+
+        // A real reply clears the flag, so the next reply turn can complete.
+        emit("input");
+        emit("agent_start");
+        emit("agent_end", { messages: [] }, { shutdown() {} });
+        emit("agent_settled", {}, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true, "an actual reply still permits a fresh turn to exit");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not report a retry error after Escape cancels retry backoff", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, emitTerminalInput, installTerminalInputHandler, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("session_start", {}, {
+          isIdle() { return false; },
+          ui: {
+            setWidget() {},
+            onTerminalInput(handler: (data: string) => unknown) {
+              installTerminalInputHandler(handler);
+              return () => {};
+            },
+          },
+        });
+        emit("agent_start");
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "error", errorMessage: "transient overload" }],
+        }, { shutdown() {} });
+
+        // Pi's retry-specific Escape handler aborts only retry backoff; no
+        // aborted assistant message replaces the provisional error event.
+        emitTerminalInput("\x1b");
+        let shutdown = false;
+        emit("agent_settled", {}, {
+          isIdle() { return true; },
+          shutdown() { shutdown = true; },
+        });
+        assert.equal(shutdown, false, "cancelled retry errors must leave the session open");
+        assert.equal(existsSync(`${sessionFile}.exit`), false, "cancelled retry must not write an error sidecar");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not shut down when settlement observes a newer active run", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        let shutdown = false;
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "error", errorMessage: "provider failure" }],
+        }, { shutdown() {} });
+        emit("agent_settled", {}, {
+          isIdle() { return false; },
+          shutdown() { shutdown = true; },
+        });
+        assert.equal(shutdown, false, "a newer active run must prevent terminal shutdown");
+        assert.equal(existsSync(`${sessionFile}.exit`), false, "a newer run must prevent sidecar creation");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("defers provider-error sidecar creation and shutdown until agent_settled", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
+        let shutdown = false;
+        const ctx = { shutdown() { shutdown = true; } };
+
+        emit("agent_end", { messages }, ctx);
+        assert.equal(shutdown, false, "agent_end must allow Pi to retry");
+        assert.equal(existsSync(`${sessionFile}.exit`), false, "transient errors must not create sidecars");
+
+        emit("agent_settled", {}, ctx);
+        assert.equal(shutdown, true, "final error should shut down at settlement");
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+          type: "error",
+          errorMessage: "529 overloaded",
+          stopReason: "error",
+        });
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not preserve a transient error when Pi retries before settlement", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        const ctx = { shutdown() {} };
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "error", errorMessage: "transient overload" }],
+        }, ctx);
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+        // Pi starts another low-level run and eventually settles normally.
+        let shutdown = false;
+        const finalCtx = { shutdown() { shutdown = true; } };
+        emit("agent_start");
+        emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, finalCtx);
+        emit("agent_settled", {}, finalCtx);
+        assert.equal(shutdown, true);
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps nested-child sessions open at settlement until children finish", () => {
+      const key = Symbol.for("pi-subagents/running-children-count");
+      const previous = (globalThis as any)[key];
+      (globalThis as any)[key] = () => 1;
+      const dir = createTestDir();
+      const { emit, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
+      try {
+        emit("agent_start");
+        let shutdown = false;
+        const ctx = { shutdown() { shutdown = true; } };
+        emit("agent_end", { messages: [] }, ctx);
+        emit("agent_settled", {}, ctx);
+        assert.equal(shutdown, false, "nested children keep the parent session open");
+
+        (globalThis as any)[key] = () => 0;
+        emit("agent_start");
+        emit("agent_end", { messages: [] }, ctx);
+        emit("agent_settled", {}, ctx);
+        assert.equal(shutdown, true, "parent exits once nested children finish");
+      } finally {
+        if (previous === undefined) delete (globalThis as any)[key];
+        else (globalThis as any)[key] = previous;
         restore();
         rmSync(dir, { recursive: true, force: true });
       }
@@ -2049,7 +2245,7 @@ describe("subagent activity snapshots", () => {
     });
   });
 
-  it("records waiting and final done states", () => {
+  it("records waiting at agent_end and final done at agent_settled", () => {
     withTempDir((dir) => {
       let currentNow = 2_000;
       const activityFile = getSubagentActivityFile(dir, "child-2");
@@ -2066,12 +2262,14 @@ describe("subagent activity snapshots", () => {
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "waiting");
       assert.equal(read.activity.waitingSince, 3_000);
+      assert.equal(read.activity.latestEvent, "agent_end");
 
       currentNow = 4_000;
-      recorder.agentEndDone();
+      recorder.agentSettledDone();
       read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "done");
+      assert.equal(read.activity.latestEvent, "agent_settled");
       assert.equal(read.activity.agentActive, false);
     });
   });
