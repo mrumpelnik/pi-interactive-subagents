@@ -1,6 +1,6 @@
 ---
 name: scout
-description: Fast codebase recon — explores files, finds patterns, maps architecture
+description: Read-only codebase recon for mapping files, tracing flows, and finding patterns before editing
 tools: read, grep, find, ls
 # Read-only Xcode discovery tools; other extension tools stay unavailable.
 extension-tools: xcode_XcodeGlob,xcode_XcodeGrep,xcode_XcodeLS,xcode_XcodeRead,xcode_XcodeListRunDestinations,xcode_XcodeListSchemes,xcode_XcodeListTargets,xcode_XcodeListTestPlans,xcode_XcodeListWorkspaces

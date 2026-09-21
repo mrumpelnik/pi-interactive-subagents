@@ -1,6 +1,6 @@
 ---
 name: worker
-description: General-purpose worker — reads, writes, and edits code
+description: Implementation agent for code changes, tests, and fixes; can delegate recon and web research
 tools: read, write, edit, bash, web_search, web_fetch
 extension-tools: all
 subagent_agents: scout, researcher

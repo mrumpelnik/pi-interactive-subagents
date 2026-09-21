@@ -1196,10 +1196,14 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
+  it("all bundled agents are discoverable with useful autonomous profiles", () => {
+    for (const name of ["planner", "scout", "researcher", "reviewer", "worker"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+      assert.ok(
+        defs.description && defs.description.length >= 30,
+        `expected bundled agent ${name} to have a meaningful description`,
+      );
       assert.equal(
         testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
         false,

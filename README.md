@@ -97,13 +97,15 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 ## Bundled agents
 
-| Agent | Model | Tools | Role |
+| Agent | Tools | Use it for | Deliverable |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **planner** | `read`, `grep`, `find`, `ls` | Planning non-trivial changes before implementation | File-specific plan with dependencies, validation, and risks |
+| **scout** | `read`, `grep`, `find`, `ls` | Read-only codebase recon and architecture mapping | Structured file, code, and architecture findings |
+| **researcher** | `web_search`, `web_fetch`, `safe_bash` | External docs, current APIs, comparisons, and technical research | Sourced brief with findings, sources, and gaps |
+| **reviewer** | `read`, `grep`, `find`, `ls` | Reviewing code or diffs for regressions and risks | Severity-ranked findings and a concise verdict |
+| **worker** | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | Implementing code changes, tests, and fixes | Change summary, verification, and notes; may spawn `scout` and `researcher` |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+All five are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
 ## Custom agents
 

@@ -1,6 +1,6 @@
 ---
 name: researcher
-description: Web researcher — searches the web and synthesizes findings
+description: Web research for external docs, current APIs, comparisons, and sourced technical findings
 tools: web_search, web_fetch, safe_bash
 extension-tools: all
 model: openai-codex/gpt-5.6-luna

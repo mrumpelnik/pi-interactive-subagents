@@ -18,6 +18,10 @@ const execFileAsync = promisify(execFile);
 const tmux = (...args: string[]) => execFileSync("tmux", args, { encoding: "utf8" }).trim();
 const parentPane = process.env.TMUX_PANE!;
 const parentWindow = tmux("display-message", "-p", "-t", parentPane, "#{window_id}");
+// Keep repeated or overlapping test runs from reusing a window left by an
+// earlier run that used the parent pane as its owner.
+const testOwner = `tmux-window-test-${process.pid}-${Date.now()}`;
+process.env[ROOT_OWNER_ENV] = testOwner;
 
 after(() => {
   try { closeAgentWindow(); } catch {}
@@ -33,7 +37,7 @@ test("creates, closes, and reopens a detached owned window without stealing focu
   assert.notEqual(agentWindow, parentWindow);
 
   const owner = tmux("show-options", "-wqv", "-t", agentWindow!, "@pi_subagents_owner");
-  assert.equal(owner, parentPane);
+  assert.equal(owner, testOwner);
   assert.equal(tmux("display-message", "-p", "-t", agentWindow!, "#{window_name}"), "pi-agents");
   assert.equal(tmux("show-options", "-wqv", "-t", agentWindow!, "automatic-rename"), "off");
   assert.equal(tmux("show-options", "-wqv", "-t", agentWindow!, "allow-rename"), "off");
