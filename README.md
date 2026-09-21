@@ -116,6 +116,8 @@ description: Does something specific
 model: openrouter/z-ai/glm-5.3
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
+# Optional: "all" or a comma-separated list of extension tool names
+# extension-tools: all
 session-mode: lineage-only
 auto-exit: true
 ---
@@ -131,7 +133,8 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `powershell`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `extension-tools` | string | Optional extension-tool access. Use `all` to load normal extensions and expose all extension tools while retaining the built-in `tools` restriction, or provide a comma-separated list of extension tool names to add to the allowlist |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -162,7 +165,9 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only at the Pi tool/extension level**—this is not an OS or container sandbox. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Access is **whitelist-only at the Pi tool/extension level** by default—this is not an OS or container sandbox. Every sub-agent process without `extension-tools` is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+
+Agents with `extension-tools: all` use normal extension discovery and retain their built-in `tools` restriction while exposing all extension tools. Agents with a named `extension-tools` list use normal extension discovery and add those extension tool names to their regular allowlist. This is intentionally broader than MCP: it applies to every Pi extension tool, and missing extensions simply contribute no tools.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 

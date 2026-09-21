@@ -45,6 +45,7 @@ import {
   summarizeSessionStats,
   writeSubagentLoadout,
   type SessionStats,
+  type McpToolSelection,
   type SubagentLoadout,
 } from "./session.ts";
 import {
@@ -125,6 +126,8 @@ type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 interface AgentDefaults {
   model?: string;
   tools?: string;
+  /** Optional extension tool mode: "all" or a comma-separated tool-name list. */
+  extensionTools?: McpToolSelection;
   skills?: string;
   thinking?: string;
   /**
@@ -168,7 +171,7 @@ const SPAWNING_TOOLS = [
 ] as const;
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
-const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
+const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
@@ -262,6 +265,12 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
 }
 
+function parseExtensionTools(value: string | undefined): McpToolSelection | undefined {
+  if (value == null) return undefined;
+  if (value.trim() === "all") return "all";
+  return parseCommaList(value);
+}
+
 /** Parse a comma-separated frontmatter value into a trimmed list (or undefined). */
 function parseCommaList(value: string | undefined): string[] | undefined {
   if (value == null) return undefined;
@@ -289,6 +298,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
     tools: getFrontmatterValue(frontmatter, "tools"),
+    extensionTools: parseExtensionTools(getFrontmatterValue(frontmatter, "extension-tools")),
     systemPromptMode:
       systemPromptMode === "replace"
         ? "replace"
@@ -861,7 +871,8 @@ function buildSubagentToolAllowlist(
 /**
  * Apply a loadout snapshot's sandbox to a pi command's `parts` array: model,
  * identity (system prompt), and the default-deny tool/extension restriction
- * (`--no-extensions` + `--tools` + one `-e` per tool-backing extension).
+ * (`--no-extensions` + `--tools` + one `-e` per tool-backing extension), or
+ * optional extension-tool mode (`--exclude-tools` / named extension tools with normal discovery).
  *
  * This is the single source of truth for reconstructing a subagent's sandbox,
  * used both by the initial `launchSubagent` and by the `subagent_message`
@@ -894,22 +905,48 @@ function applySandboxToParts(
     parts.push(flag, shellEscape(spPath));
   }
 
-  // Default-deny: a loadout without a concrete allowlist is not safe to
-  // replay. Refuse rather than silently restoring Pi's full tool/extension
-  // surface.
-  if (!loadout.toolAllowlist) {
-    throw new Error("Restricted subagent loadout has no tool allowlist");
-  }
-  parts.push("--no-extensions");
-  parts.push("--tools", shellEscape(loadout.toolAllowlist));
+  if (loadout.extensionTools) {
+    // Extension-tool mode keeps normal extension discovery enabled. `all` grants every
+    // extension tool while preserving the agent's built-in tool restriction;
+    // named mode adds only the requested extension tool names to the allowlist.
+    if (loadout.extensionTools === "all") {
+      const requestedBuiltins = new Set(
+        (parseCommaList(loadout.toolAllowlist) ?? []).filter((tool) => BUILTIN_TOOLS.has(tool)),
+      );
+      const excluded = [...BUILTIN_TOOLS].filter((tool) => !requestedBuiltins.has(tool));
+      // Extension discovery also exposes the subagent-management tools. Keep
+      // the documented deny-by-default spawn policy unless this profile has an
+      // explicit non-empty subagent_agents list.
+      if (!loadout.spawnable || loadout.spawnable.length === 0) {
+        excluded.push(...SPAWNING_TOOLS);
+      }
+      if (excluded.length > 0) parts.push("--exclude-tools", shellEscape(excluded.join(",")));
+    } else {
+      const requested = new Set(parseCommaList(loadout.toolAllowlist) ?? []);
+      for (const tool of loadout.extensionTools) requested.add(tool);
+      if (!loadout.spawnable || loadout.spawnable.length === 0) {
+        for (const tool of SPAWNING_TOOLS) requested.delete(tool);
+      }
+      if (requested.size > 0) parts.push("--tools", shellEscape([...requested].join(",")));
+    }
+  } else {
+    // Default-deny: a loadout without a concrete allowlist is not safe to
+    // replay. Refuse rather than silently restoring Pi's full tool/extension
+    // surface.
+    if (!loadout.toolAllowlist) {
+      throw new Error("Restricted subagent loadout has no tool allowlist");
+    }
+    parts.push("--no-extensions");
+    parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
-  const extPaths = new Set<string>();
-  for (const tool of loadout.toolAllowlist.split(",")) {
-    const extPath = getToolExtensionPath(tool);
-    if (extPath && existsSync(extPath)) extPaths.add(extPath);
-  }
-  for (const extPath of extPaths) {
-    parts.push("-e", shellEscape(extPath));
+    const extPaths = new Set<string>();
+    for (const tool of loadout.toolAllowlist.split(",")) {
+      const extPath = getToolExtensionPath(tool);
+      if (extPath && existsSync(extPath)) extPaths.add(extPath);
+    }
+    for (const extPath of extPaths) {
+      parts.push("-e", shellEscape(extPath));
+    }
   }
 }
 
@@ -1214,6 +1251,7 @@ async function launchSubagent(
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
+  const effectiveExtensionTools = agentDefs?.extensionTools;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
@@ -1314,6 +1352,7 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
+    extensionTools: effectiveExtensionTools,
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,

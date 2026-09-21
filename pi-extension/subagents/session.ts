@@ -86,18 +86,22 @@ export function seedSubagentSessionFile(params: {
  *
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
  * time. Resume replays this exact snapshot so the reincarnated process gets the
- * same `--no-extensions` + `--tools` restriction, model, identity, spawn
- * whitelist, cwd, and config dir it originally ran with — instead of falling
+ * same extension/tool restriction, model, identity, spawn whitelist, cwd, and
+ * config dir it originally ran with — instead of falling
  * back to pi's default (all global extensions + full toolset). Storing the
  * resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
  * resume faithful even if the agent definition is later edited, moved, or
  * deleted.
  */
+export type McpToolSelection = "all" | string[];
+
 export interface SubagentLoadout {
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
-  /** The concrete `--tools` allowlist used by the restricted child. Null is a legacy snapshot that cannot be resumed. */
+  /** The concrete base tool selection used by the child; null is a legacy snapshot that cannot be resumed. */
   toolAllowlist: string | null;
+  /** Optional extension-tool mode captured from the agent definition. */
+  extensionTools?: McpToolSelection;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
@@ -121,10 +125,17 @@ export function loadoutSidecarPath(sessionFile: string): string {
   return `${sessionFile}.loadout.json`;
 }
 
+/** Write JSON atomically so readers never observe a partial file. */
+function writeJsonAtomically(path: string, value: unknown): void {
+  const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2), "utf8");
+  renameSync(tmp, path);
+}
+
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
   try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
+    writeJsonAtomically(loadoutSidecarPath(sessionFile), loadout);
   } catch {
     // Best-effort: a missing snapshot only means resume will refuse, never that
     // it launches unrestricted.
@@ -137,7 +148,15 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     const p = loadoutSidecarPath(sessionFile);
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const extensionTools = (parsed as { extensionTools?: unknown }).extensionTools;
+    if (
+      extensionTools !== undefined &&
+      extensionTools !== "all" &&
+      (!Array.isArray(extensionTools) || !extensionTools.every((tool) => typeof tool === "string" && tool.length > 0))
+    ) {
+      return null;
+    }
     return parsed as SubagentLoadout;
   } catch {
     return null;
@@ -194,10 +213,7 @@ export function registerName(
     mkdirSync(artifactDir, { recursive: true });
     const registry = readNameRegistry(artifactDir);
     registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-    renameSync(tmp, p);
+    writeJsonAtomically(nameRegistryPath(artifactDir), registry);
   } catch {
     // Best-effort: a failed registration only means resume-by-name won't find
     // this subagent later; it never breaks the spawn itself.

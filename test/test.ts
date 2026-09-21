@@ -327,6 +327,7 @@ describe("session.ts", () => {
     const sample: SubagentLoadout = {
       agent: "worker",
       toolAllowlist: "read,write,edit,safe_bash,web_search,subagent,ask_question",
+      extensionTools: ["xcodebuild_list_sims"],
       model: "openrouter/z-ai/glm-5.2",
       thinking: "medium",
       systemPromptMode: "append",
@@ -354,10 +355,21 @@ describe("session.ts", () => {
       assert.equal(readSubagentLoadout(join(dir, "missing.jsonl")), null);
     });
 
-    it("returns null when the sidecar is corrupt", () => {
-      const sf = join(dir, "s3.jsonl");
-      writeFileSync(sf + ".loadout.json", "not json{", "utf8");
-      assert.equal(readSubagentLoadout(sf), null);
+    it("round-trips all extension tools mode", () => {
+      const sf = join(dir, "s-all.jsonl");
+      const loadout = { ...sample, extensionTools: "all" as const };
+      writeSubagentLoadout(sf, loadout);
+      assert.deepEqual(readSubagentLoadout(sf), loadout);
+    });
+
+    it("returns null when the sidecar is corrupt or has invalid extension tools", () => {
+      const corrupt = join(dir, "s3.jsonl");
+      writeFileSync(corrupt + ".loadout.json", "not json{", "utf8");
+      assert.equal(readSubagentLoadout(corrupt), null);
+
+      const invalid = join(dir, "s4.jsonl");
+      writeFileSync(invalid + ".loadout.json", JSON.stringify({ ...sample, extensionTools: { all: true } }), "utf8");
+      assert.equal(readSubagentLoadout(invalid), null);
     });
   });
 
@@ -1078,6 +1090,24 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loads optional extension tool modes from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "extension-all-test-agent",
+        ["name: extension-all-test-agent", "extension-tools: all"].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "extension-list-test-agent",
+        ["name: extension-list-test-agent", "extension-tools: xcode_a,xcode_b"].join("\n"),
+      );
+
+      assert.equal(testApi.loadAgentDefaults("extension-all-test-agent")?.extensionTools, "all");
+      assert.deepEqual(testApi.loadAgentDefaults("extension-list-test-agent")?.extensionTools, ["xcode_a", "xcode_b"]);
+    });
+  });
+
   it("loads explicit interactive flag from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1311,6 +1341,62 @@ describe("subagent discovery", () => {
         "expected the tool allowlist as the --tools value",
       );
     });
+  });
+
+  it("enables all extension tools while excluding disallowed built-ins for extension-all mode", () => {
+    const parts: string[] = [];
+    testApi.applySandboxToParts(
+      parts,
+      {
+        agent: "xcode-researcher",
+        toolAllowlist: "read,write,ask_question",
+        extensionTools: "all",
+        model: null,
+        thinking: null,
+        systemPromptMode: null,
+        identity: null,
+        spawnable: null,
+        autoExit: true,
+        cwd: null,
+        agentDir: null,
+      },
+      { artifactDir: "/tmp", name: "xcode-researcher" },
+    );
+    assert.ok(!parts.includes("--no-extensions"));
+    assert.ok(!parts.includes("--tools"));
+    const excludeIndex = parts.indexOf("--exclude-tools");
+    assert.ok(excludeIndex >= 0);
+    assert.match(parts[excludeIndex + 1], /edit/);
+    assert.match(parts[excludeIndex + 1], /grep/);
+    assert.match(parts[excludeIndex + 1], /subagent/);
+    assert.doesNotMatch(parts[excludeIndex + 1], /read/);
+  });
+
+  it("adds named extension tools to an agent's normal tool allowlist", () => {
+    const parts: string[] = [];
+    testApi.applySandboxToParts(
+      parts,
+      {
+        agent: "xcode-researcher",
+        toolAllowlist: "read,write",
+        extensionTools: ["xcode_a", "xcode_b"],
+        model: null,
+        thinking: null,
+        systemPromptMode: null,
+        identity: null,
+        spawnable: null,
+        autoExit: true,
+        cwd: null,
+        agentDir: null,
+      },
+      { artifactDir: "/tmp", name: "xcode-researcher" },
+    );
+    assert.ok(!parts.includes("--no-extensions"));
+    const toolsIndex = parts.indexOf("--tools");
+    assert.ok(toolsIndex >= 0);
+    assert.match(parts[toolsIndex + 1], /read/);
+    assert.match(parts[toolsIndex + 1], /xcode_a/);
+    assert.match(parts[toolsIndex + 1], /xcode_b/);
   });
 
   it("rejects a loadout without a tool allowlist", () => {
