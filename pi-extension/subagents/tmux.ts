@@ -417,32 +417,51 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelToken?: string;
     onTick?: (elapsed: number) => void;
+    /** Test seams for deterministic sidecar/sentinel polling coverage. */
+    surfaceExists?: (surface: string) => boolean;
+    readScreenAsync?: (surface: string, lines?: number) => Promise<string>;
   },
 ): Promise<PollResult> {
+  const isSurfacePresent = options.surfaceExists ?? surfaceExists;
+  const readScreen = options.readScreenAsync ?? readScreenAsync;
   const start = Date.now();
+  // `.exit` is metadata written while the child is still running its graceful
+  // shutdown handlers. Keep it in memory, but wait for the shell sentinel (or
+  // pane exit) before declaring completion and deleting the sidecar.
+  let sidecarResult: PollResult | undefined;
+  let sidecarFile: string | undefined;
   for (;;) {
     if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
     if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
+      sidecarFile = `${options.sessionFile}.exit`;
+      if (!sidecarResult) {
+        try {
+          if (existsSync(sidecarFile)) {
+            sidecarResult = interpretExitSidecar(JSON.parse(readFileSync(sidecarFile, "utf8")));
+          }
+        } catch {
+          // The sidecar may be in the middle of being written; retry it.
         }
-      } catch {}
+      }
     }
-    if (!surfaceExists(surface)) {
+    if (!isSurfacePresent(surface)) {
+      if (sidecarResult) {
+        if (sidecarFile) rmSync(sidecarFile, { force: true });
+        return sidecarResult;
+      }
       return { reason: "error", exitCode: 1, errorMessage: "The subagent pane was closed." };
     }
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await readScreen(surface, 5);
       const token = options.sentinelToken?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const pattern = token
         ? new RegExp(`__SUBAGENT_DONE_${token}_(\\d+)__`)
         : /__SUBAGENT_DONE_(\d+)__/;
       const match = screen.match(pattern);
-      if (match) return { reason: "sentinel", exitCode: Number.parseInt(match[1], 10) };
+      if (match) {
+        if (sidecarFile) rmSync(sidecarFile, { force: true });
+        return sidecarResult ?? { reason: "sentinel", exitCode: Number.parseInt(match[1], 10) };
+      }
     } catch {}
     options.onTick?.(Math.floor((Date.now() - start) / 1000));
     await new Promise<void>((resolve, reject) => {

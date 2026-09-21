@@ -451,7 +451,7 @@ function formatTokens(n: number): string {
 function contextWindowFor(model: string | null | undefined): number | undefined {
   if (!model) return undefined;
   const m = model.toLowerCase();
-  if (m.includes("claude")) return 200_000;
+  if (m.includes("gpt-5.6")) return 200_000;
   if (m.includes("gpt-4.1") || m.includes("gpt-4o")) return 128_000;
   if (m.includes("gemini")) return 1_000_000;
   return undefined;
@@ -636,7 +636,81 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+/**
+ * Resume paths reserved synchronously while a resume is being set up. The
+ * setup contains an async shell-readiness wait, so checking only
+ * runningSubagents is not enough to prevent two Pi processes from opening the
+ * same JSONL concurrently.
+ */
+interface PendingResume {
+  promise: Promise<RunningSubagent>;
+  resolve: (running: RunningSubagent) => void;
+  reject: (error: unknown) => void;
+}
+const pendingResumes = new Map<string, PendingResume>();
 let runtimeRegistryFile: string | null = null;
+
+interface SubagentTestHooks {
+  isMuxAvailable?: () => boolean;
+  muxOwnerEnvPart?: () => string;
+  createSurface?: (name: string, cwd?: string) => string;
+  sendCommand?: (surface: string, command: string) => void;
+  sendLongCommand?: (
+    surface: string,
+    command: string,
+    options?: { scriptPath?: string; scriptPreamble?: string },
+  ) => string;
+  closeSurface?: (surface: string) => void;
+}
+
+let subagentTestHooks: SubagentTestHooks = {};
+
+function setSubagentTestHooks(hooks: SubagentTestHooks): void {
+  subagentTestHooks = hooks;
+}
+
+function setLatestPiForTest(pi: ExtensionAPI | null): void {
+  latestPi = pi;
+}
+
+function stopSubagentTestTimers(): void {
+  if (widgetInterval) {
+    clearInterval(widgetInterval);
+    widgetInterval = null;
+  }
+  if (statusInterval) {
+    clearInterval(statusInterval);
+    statusInterval = null;
+  }
+}
+
+function subagentMuxAvailable(): boolean {
+  return subagentTestHooks.isMuxAvailable?.() ?? isMuxAvailable();
+}
+
+function subagentMuxOwnerEnvPart(): string {
+  return subagentTestHooks.muxOwnerEnvPart?.() ?? muxOwnerEnvPart();
+}
+
+function subagentCreateSurface(name: string, cwd?: string): string {
+  return subagentTestHooks.createSurface?.(name, cwd) ?? createSurface(name, cwd);
+}
+
+function subagentSendCommand(surface: string, command: string): void {
+  (subagentTestHooks.sendCommand ?? sendCommand)(surface, command);
+}
+
+function subagentSendLongCommand(
+  surface: string,
+  command: string,
+  options?: { scriptPath?: string; scriptPreamble?: string },
+): string {
+  return (subagentTestHooks.sendLongCommand ?? sendLongCommand)(surface, command, options);
+}
+
+function subagentCloseSurface(surface: string): void {
+  (subagentTestHooks.closeSurface ?? closeSurface)(surface);
+}
 
 class WatcherDetachedError extends Error {}
 
@@ -1072,7 +1146,7 @@ function resolveRunningByName(name: string):
 function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string) => void = subagentSendCommand,
 ): { ok: true } | { error: string } {
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
@@ -1089,7 +1163,7 @@ function steerSubagent(
 
 function handleSubagentSteer(
   params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string) => void = subagentSendCommand,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1222,6 +1296,11 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  deliverPendingQuestion,
+  setSubagentTestHooks,
+  setLatestPiForTest,
+  stopSubagentTestTimers,
+  pendingResumes,
 };
 
 function startWidgetRefresh() {
@@ -1279,12 +1358,16 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name, targetCwdForSession);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  const surface = options?.surface ?? subagentCreateSurface(params.name, targetCwdForSession);
+  // A surface created here is owned by this launch attempt until the running
+  // record is registered. If any fallible setup below fails, close only that
+  // surface; a caller-provided surface belongs to the caller.
+  try {
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+    const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1371,7 +1454,7 @@ async function launchSubagent(
   // Build env prefix: root tmux ownership + subagent identity + config dir
   // propagation + spawn allowlist. The root token is intentionally explicit so
   // nested children do not claim a window using their own pane id.
-  const envParts: string[] = [muxOwnerEnvPart()];
+  const envParts: string[] = [subagentMuxOwnerEnvPart()];
 
   if (resolvedAgentDir) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
@@ -1442,7 +1525,7 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
+  subagentSendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
@@ -1469,8 +1552,16 @@ async function launchSubagent(
     }),
   };
 
-  runningSubagents.set(id, running);
-  return running;
+    runningSubagents.set(id, running);
+    return running;
+  } catch (error) {
+    if (!surfacePreCreated) {
+      try {
+        subagentCloseSurface(surface);
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 /**
@@ -1488,37 +1579,43 @@ async function launchSubagent(
  */
 function deliverPendingQuestion(running: RunningSubagent): void {
   const askFile = `${running.sessionFile}.ask`;
-  let payload: any = null;
+  let payload: any;
   try {
     if (!existsSync(askFile)) return;
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
   } catch {
-    // Malformed/partway-written file — drop it and move on.
+    // Keep malformed files in place. A writer may still be replacing the file,
+    // and a later tick can retry it; dropping it would lose the question.
+    return;
   }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
+  if (!payload?.question || !latestPi) return;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  latestPi?.sendMessage(
-    {
-      customType: "subagent_question",
-      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
-      display: true,
-      details: {
-        name,
-        agent: running.agent,
-        question: payload.question,
-        ...(sessionId ? { sessionId } : {}),
+  try {
+    latestPi.sendMessage(
+      {
+        customType: "subagent_question",
+        content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
+        display: true,
+        details: {
+          name,
+          agent: running.agent,
+          question: payload.question,
+          ...(sessionId ? { sessionId } : {}),
+        },
       },
-    },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+    // Only consume the signal once the parent accepted the notification. If
+    // delivery throws, the file remains for the next poll tick.
+    unlinkSync(askFile);
+  } catch {
+    // Notification failures must not escape onTick and terminate the watcher.
+  }
 }
 
 async function watchSubagent(
@@ -1534,7 +1631,12 @@ async function watchSubagent(
       sentinelToken: running.id,
       onTick() {
         observeRunningSubagent(running);
-        deliverPendingQuestion(running);
+        try {
+          deliverPendingQuestion(running);
+        } catch {
+          // A notification bug must never make the completion watcher close the
+          // child pane. The sidecar remains available for a later tick.
+        }
       },
     });
 
@@ -1562,7 +1664,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    subagentCloseSurface(surface);
     runningSubagents.delete(running.id);
     persistRuntimeRegistry();
 
@@ -1582,7 +1684,7 @@ async function watchSubagent(
       throw new WatcherDetachedError("Subagent watcher detached during session lifecycle change");
     }
     try {
-      closeSurface(surface);
+      subagentCloseSurface(surface);
     } catch {}
     runningSubagents.delete(running.id);
     persistRuntimeRegistry();
@@ -1776,7 +1878,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Validate prerequisites (need mux + a session file to derive the
         // artifact dir that hosts this session's name registry).
-        if (!isMuxAvailable()) {
+        if (!subagentMuxAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -1802,15 +1904,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Default the cosmetic pane label to the agent name when omitted,
         // disambiguating against running subagents, in-flight reservations, and
         // every name already in the registry — so names stay unique across the
-        // whole session, running or finished. Reserve the chosen name
-        // synchronously (before any await) so parallel spawns don't collide.
-        let reservedName: string | null = null;
-        if (!params.name?.trim()) {
-          const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
-          params.name = uniqueRunningName(params.agent, registryNames);
-          reservedName = params.name;
-          reservedNames.add(reservedName);
+        // whole session, running or finished. Explicit names are handles too,
+        // so reject collisions rather than overwriting the persistent registry.
+        const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+        let requestedName = params.name?.trim();
+        if (!requestedName) {
+          requestedName = uniqueRunningName(params.agent, registryNames);
+          params.name = requestedName;
+        } else {
+          params.name = requestedName;
         }
+        const nameTaken = registryNames.has(requestedName) ||
+          Array.from(runningSubagents.values()).some((running) => running.name === requestedName) ||
+          reservedNames.has(requestedName);
+        if (nameTaken) {
+          const err = `Subagent name "${requestedName}" is already in use. Choose a unique name.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        // Reserve every name synchronously (before any await), including
+        // explicit names, so parallel spawns cannot launch duplicate handles.
+        const reservedName = requestedName;
+        reservedNames.add(reservedName);
 
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
@@ -1819,7 +1934,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         try {
           running = await launchSubagent(params, ctx);
         } finally {
-          if (reservedName) reservedNames.delete(reservedName);
+          reservedNames.delete(reservedName);
         }
 
         // Persist name → session so subagent_message({ name }) can resume this
@@ -2095,7 +2210,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        if (!isMuxAvailable()) {
+        if (!subagentMuxAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -2137,12 +2252,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        const canonicalSessionPath = resolve(sessionPath);
+
         // Guard: never resume a session that is still running — two processes
-        // mutating the same .jsonl corrupts it. Steer it by name instead.
+        // mutating the same .jsonl corrupt it. Steer it by name instead.
         for (const r of runningSubagents.values()) {
-          if (resolve(r.sessionFile) === resolve(sessionPath)) {
+          if (resolve(r.sessionFile) === canonicalSessionPath) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
             return handleSubagentSteer({ name: r.name, message: params.message });
+          }
+        }
+
+        // A previous resume may have created its pane and be waiting for the
+        // shell before it can register in runningSubagents. Wait for that
+        // registration, then steer the one process rather than opening the
+        // shared JSONL a second time.
+        const pendingResume = pendingResumes.get(canonicalSessionPath);
+        if (pendingResume) {
+          try {
+            const running = await pendingResume.promise;
+            return handleSubagentSteer({ name: running.name, message: params.message });
+          } catch (error: any) {
+            const text = `Resume of subagent "${requestedName}" failed: ${error?.message ?? String(error)}`;
+            return { content: [{ type: "text" as const, text }], details: { error: text } };
           }
         }
 
@@ -2174,8 +2306,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name, loadout.cwd ?? ctx.cwd);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        // Reserve the canonical JSONL path before the first await. Attach a
+        // handled rejection so a lone failed resume cannot become an unhandled
+        // promise rejection; a concurrent caller receives the failure below.
+        let resolvePending!: (running: RunningSubagent) => void;
+        let rejectPending!: (error: unknown) => void;
+        const pendingPromise = new Promise<RunningSubagent>((resolve, reject) => {
+          resolvePending = resolve;
+          rejectPending = reject;
+        });
+        pendingPromise.catch(() => {});
+        const pending: PendingResume = {
+          promise: pendingPromise,
+          resolve: resolvePending,
+          reject: rejectPending,
+        };
+        pendingResumes.set(canonicalSessionPath, pending);
+        reservedNames.add(name);
+
+        let surface = "";
+        let registered = false;
+        try {
+          surface = subagentCreateSurface(name, loadout.cwd ?? ctx.cwd);
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2214,7 +2367,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // so the resumed process resolves the same agents/extensions and keeps
         // the same nested-spawn restriction it originally ran with. The root tmux
         // owner is also replayed so resumed descendants reuse the same window.
-        const resumeEnvParts: string[] = [muxOwnerEnvPart()];
+        const resumeEnvParts: string[] = [subagentMuxOwnerEnvPart()];
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
         if (resumeAgentDir) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
@@ -2249,7 +2402,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
+        subagentSendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
@@ -2277,6 +2430,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
+        registered = true;
+        pendingResumes.delete(canonicalSessionPath);
+        reservedNames.delete(name);
+        pending.resolve(running);
         persistRuntimeRegistry();
         startWidgetRefresh();
         startStatusRefresh(pi);
@@ -2344,6 +2501,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
+        } catch (error) {
+          if (!registered && surface) {
+            try {
+              subagentCloseSurface(surface);
+            } catch {}
+          }
+          if (!registered) {
+            pendingResumes.delete(canonicalSessionPath);
+            reservedNames.delete(name);
+            pending.reject(error);
+          }
+          throw error;
+        } finally {
+          if (!registered) {
+            pendingResumes.delete(canonicalSessionPath);
+            reservedNames.delete(name);
+          }
+        }
       },
     });
 

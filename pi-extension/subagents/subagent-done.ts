@@ -15,7 +15,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { writeFileSync } from "node:fs";
+import { renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -437,7 +437,21 @@ export default function (pi: ExtensionAPI) {
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      // Publish the notification atomically. The parent watcher may poll while
+      // this tool is still returning, so never expose a partially-written JSON
+      // file at the final path.
+      const askFile = `${sessionFile}.ask`;
+      const tempAskFile = `${askFile}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+      writeFileSync(tempAskFile, JSON.stringify(askData));
+      try {
+        renameSync(tempAskFile, askFile);
+      } catch (error) {
+        try {
+          // Best effort cleanup; preserve the original rename failure.
+          unlinkSync(tempAskFile);
+        } catch {}
+        throw error;
+      }
 
       return {
         content: [

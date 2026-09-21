@@ -111,22 +111,18 @@ function requireObject(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function validateFiniteNumber(object: Record<string, unknown>, fieldName: string): string | null {
-  return Number.isFinite(object[fieldName]) ? null : `${fieldName} must be finite`;
-}
-
-function validateOptionalFiniteNumber(object: Record<string, unknown>, fieldName: string): string | null {
+function validateNonNegativeSafeInteger(object: Record<string, unknown>, fieldName: string): string | null {
   const value = object[fieldName];
-  return value == null || Number.isFinite(value) ? null : `${fieldName} must be finite when present`;
+  return Number.isSafeInteger(value) && (value as number) >= 0
+    ? null
+    : `${fieldName} must be a non-negative safe integer`;
 }
 
-function validateInteger(object: Record<string, unknown>, fieldName: string): string | null {
-  return Number.isInteger(object[fieldName]) ? null : `${fieldName} must be an integer`;
-}
-
-function validateOptionalInteger(object: Record<string, unknown>, fieldName: string): string | null {
+function validateOptionalNonNegativeSafeInteger(object: Record<string, unknown>, fieldName: string): string | null {
   const value = object[fieldName];
-  return value == null || Number.isInteger(value) ? null : `${fieldName} must be an integer when present`;
+  return value == null || (Number.isSafeInteger(value) && (value as number) >= 0)
+    ? null
+    : `${fieldName} must be a non-negative safe integer when present`;
 }
 
 function validateBoolean(object: Record<string, unknown>, fieldName: string): string | null {
@@ -165,23 +161,52 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   }
 
   const validationError = [
-    validateFiniteNumber(object, "createdAt"),
-    validateFiniteNumber(object, "updatedAt"),
-    validateInteger(object, "sequence"),
+    validateNonNegativeSafeInteger(object, "createdAt"),
+    validateNonNegativeSafeInteger(object, "updatedAt"),
+    validateNonNegativeSafeInteger(object, "sequence"),
     validateBoolean(object, "agentActive"),
     validateBoolean(object, "turnActive"),
     validateBoolean(object, "providerActive"),
     validateBoolean(object, "toolActive"),
-    validateOptionalFiniteNumber(object, "activeSince"),
-    validateOptionalFiniteNumber(object, "waitingSince"),
-    validateOptionalInteger(object, "turnIndex"),
-    validateOptionalFiniteNumber(object, "toolStartedAt"),
-    validateOptionalFiniteNumber(object, "toolEndedAt"),
+    validateOptionalNonNegativeSafeInteger(object, "activeSince"),
+    validateOptionalNonNegativeSafeInteger(object, "waitingSince"),
+    validateOptionalNonNegativeSafeInteger(object, "turnIndex"),
+    validateOptionalNonNegativeSafeInteger(object, "toolStartedAt"),
+    validateOptionalNonNegativeSafeInteger(object, "toolEndedAt"),
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
+
+  const createdAt = object.createdAt as number;
+  const updatedAt = object.updatedAt as number;
+  if (updatedAt < createdAt) return invalidActivity("updatedAt must be greater than or equal to createdAt");
+
+  const activeScope = object.activeScope;
+  const activeSince = object.activeSince as number | undefined;
+  const waitingSince = object.waitingSince as number | undefined;
+  if (object.phase === "active" && activeScope == null) return invalidActivity("active phase requires activeScope");
+  if (object.phase !== "active" && activeScope != null) return invalidActivity("activeScope requires active phase");
+  if (activeSince != null && activeScope == null) return invalidActivity("activeSince requires activeScope");
+  if (object.phase === "waiting" && waitingSince == null) return invalidActivity("waiting phase requires waitingSince");
+  if (object.phase !== "waiting" && waitingSince != null) return invalidActivity("waitingSince requires waiting phase");
+
+  for (const fieldName of ["activeSince", "waitingSince", "toolStartedAt", "toolEndedAt"] as const) {
+    const value = object[fieldName];
+    if (value != null && ((value as number) < createdAt || (value as number) > updatedAt)) {
+      return invalidActivity(`${fieldName} must be between createdAt and updatedAt`);
+    }
+  }
+
+  const toolStartedAt = object.toolStartedAt as number | undefined;
+  const toolEndedAt = object.toolEndedAt as number | undefined;
+  if (toolEndedAt != null && toolStartedAt == null) {
+    return invalidActivity("toolEndedAt requires toolStartedAt");
+  }
+  if (toolStartedAt != null && toolEndedAt != null && toolEndedAt < toolStartedAt) {
+    return invalidActivity("toolEndedAt must be greater than or equal to toolStartedAt");
+  }
 
   return { ok: true, activity: object as unknown as SubagentActivityState };
 }
@@ -297,12 +322,15 @@ export function createSubagentActivityRecorder(params: {
   runningChildId?: string;
   activityFile?: string;
   now?: () => number;
+  /** Test seam for deterministic persistence-failure coverage. */
+  writeActivityFile?: typeof writeSubagentActivityFile;
 }): SubagentActivityRecorder {
   const runningChildId = params.runningChildId?.trim();
   const activityFile = params.activityFile?.trim();
   if (!runningChildId || !activityFile) return createNoopRecorder();
 
   const now = params.now ?? (() => Date.now());
+  const writeActivityFile = params.writeActivityFile ?? writeSubagentActivityFile;
   const createdAt = now();
   const activity: SubagentActivityState = {
     version: 1,
@@ -329,20 +357,27 @@ export function createSubagentActivityRecorder(params: {
     pendingFlush = null;
   }
 
-  function disable(): void {
+  function disable(invalidateSnapshot = false): void {
     disabled = true;
     clearPendingFlush();
+    if (invalidateSnapshot) {
+      // A recorder that can no longer persist progress must not leave a
+      // previously-written snapshot looking current to the parent.
+      try {
+        unlinkSync(activityFile);
+      } catch {}
+    }
   }
 
   function flushNow(): void {
     if (disabled) return;
     try {
-      writeSubagentActivityFile(activityFile, activity);
+      writeActivityFile(activityFile, activity);
       lastFlushAt = now();
       failureCount = 0;
     } catch {
       failureCount += 1;
-      if (failureCount >= MAX_WRITE_FAILURES) disable();
+      if (failureCount >= MAX_WRITE_FAILURES) disable(true);
     }
   }
 

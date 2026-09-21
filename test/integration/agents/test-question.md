@@ -1,7 +1,8 @@
 ---
 name: test-question
 description: Integration test agent — asks the parent a question instead of completing task
-model: anthropic/claude-haiku-4-5
+model: openai-codex/gpt-5.6-luna
+thinking: low
 tools: read, bash
 spawning: false
 disable-model-invocation: true
