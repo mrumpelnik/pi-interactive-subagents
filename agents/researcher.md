@@ -3,7 +3,7 @@ name: researcher
 description: Web research for external docs, current APIs, comparisons, and sourced technical findings
 tools: web_search, web_fetch, safe_bash
 extension-tools: all
-model: openai-codex/gpt-5.6-luna
+model: openai-codex/gpt-6-luna
 thinking: medium
 system-prompt: append
 auto-exit: true

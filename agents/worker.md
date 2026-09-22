@@ -4,8 +4,8 @@ description: Implementation agent for code changes, tests, and fixes; can delega
 tools: read, write, edit, bash, web_search, web_fetch
 extension-tools: all
 subagent_agents: scout, researcher
-model: openai-codex/gpt-5.6-luna
-thinking: xhigh
+model: openai-codex/gpt-6-luna
+thinking: max
 system-prompt: append
 auto-exit: true
 ---

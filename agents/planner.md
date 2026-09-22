@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Read-only planning for non-trivial changes; maps scope, dependencies, validation, alternatives, and risks
-model: openai-codex/gpt-5.6-sol
+model: openai-codex/gpt-6-sol
 thinking: medium
 tools: read, grep, find, ls
 system-prompt: append

@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Read-only review of code or diffs; finds regressions, security and reliability risks, and missing tests
-model: openai-codex/gpt-5.6-sol
+model: openai-codex/gpt-6-sol
 thinking: medium
 tools: read, grep, find, ls
 system-prompt: append
